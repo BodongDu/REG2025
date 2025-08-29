@@ -24,15 +24,15 @@ from xtuner.utils import PROMPT_TEMPLATE
 llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
 
 # Data
-data_path = 'slidechat_train_vqa_stage2.json'
+data_path = '/suanfs/usrhome/bduag/REG/filtered_output.json'
 image_path_list = None
-pretrained_pth = 'stage1_pth'
+pretrained_pth = '/suanfs/usrhome/bduag/SlideChat/stage1_pth'
 
 prompt_template = PROMPT_TEMPLATE.qwen_chat
 
 
-max_length = 19600
-per_image_length = None
+max_length = 512
+per_image_length = 256
 sample_type='wsi' # 'wsi'or'image'
 
 # Scheduler & Optimizer
@@ -54,7 +54,7 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 # Evaluate the generation performance during the training
 evaluation_freq = 1000
 SYSTEM = ''
-evaluation_images = './BLCA/TCGA-GV-A40G-01Z-00-DX1.csv'
+evaluation_images = '/suanfs/usrhome/bduag/REG_train_clam/csv/PIT_01_00002_01_pry/PIT_01_00002_01_pry.csv'
 evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
 
 #######################################################################

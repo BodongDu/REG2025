@@ -1,46 +1,52 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-import torch
+from datasets import load_dataset
 from mmengine.dataset import DefaultSampler
-from mmengine.hooks import (CheckpointHook, DistSamplerSeedHook, IterTimerHook,
-                            LoggerHook, ParamSchedulerHook)
+from mmengine.hooks import (
+    CheckpointHook,
+    DistSamplerSeedHook,
+    IterTimerHook,
+    LoggerHook,
+    ParamSchedulerHook,
+)
 from mmengine.optim import AmpOptimWrapper, CosineAnnealingLR, LinearLR
 from torch.optim import AdamW
-from transformers import (AutoModelForCausalLM, AutoTokenizer,
-                          BitsAndBytesConfig, CLIPImageProcessor,
-                          CLIPVisionModel)
- 
-from xtuner.dataset import LLaVADataset
-from xtuner.dataset.collate_fns import default_collate_fn
-from xtuner.dataset.map_fns import llava_map_fn, template_map_fn_factory
-from xtuner.engine.hooks import DatasetInfoHook, EvaluateChatHook, HFCheckpointHook
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from xtuner.dataset.collate_fns.preference_collate_fn import preference_collate_fn
+from xtuner.dataset.preference_dataset import (
+    build_preference_dataset,
+    orpo_dpo_mix_40k_map_fn,
+)
+from xtuner.engine.hooks import (
+    DatasetInfoHook,
+    EvaluateChatHook,
+    VarlenAttnArgsToMessageHubHook,
+)
 from xtuner.engine.runner import TrainLoop
-from xtuner.model import LLaVAModel
-from xtuner.utils import PROMPT_TEMPLATE
-from peft import LoraConfig
+from xtuner.model.dpo import DPO
+from xtuner.utils import PROMPT_TEMPLATE, SYSTEM_TEMPLATE
+
 #######################################################################
 #                          PART 1  Settings                           #
 #######################################################################
 # Model
-llm_name_or_path = 'Qwen/Qwen2.5-7B-Instruct'
+pretrained_model_name_or_path = "Qwen/Qwen2.5-7B-Instruct"
+use_varlen_attn = False
+dpo_loss_type = "sigmoid"  # One of ['sigmoid', 'hinge', 'ipo', 'kto_pair', 'sppo_hard', 'nca_pair', 'robust']  # noqa: E501
+loss_beta = 0.1
+label_smoothing = 0.0
+
 # Data
-data_path = '/suanfs/usrhome/bduag/REG/output_all7000_newseg_prompt.json'
-image_path_list = None
-
-prompt_template = PROMPT_TEMPLATE.qwen_chat
-
-
-max_length = 512
-per_image_length = 256
-sample_type='wsi' # 'wsi'or'image'
-
+prompt_template = PROMPT_TEMPLATE.internlm2_chat
+max_length = 2048
 
 # Scheduler & Optimizer
 batch_size = 1  # per_device
-accumulative_counts = 8
-dataloader_num_workers = 32
+accumulative_counts = 16
+dataloader_num_workers = 0
 max_epochs = 3
 optim_type = AdamW
-lr = 1e-4
+lr = 5e-7  # refer to alignment handbook
 betas = (0.9, 0.999)
 weight_decay = 0
 max_norm = 1  # grad clip
@@ -52,64 +58,60 @@ save_total_limit = 2  # Maximum checkpoints to keep (-1 means unlimited)
 
 # Evaluate the generation performance during the training
 evaluation_freq = 500
-SYSTEM = ''
-evaluation_images = '/suanfs/usrhome/bduag/REG_train_clam/csv/PIT_01_00002_01_pry/PIT_01_00002_01_pry.csv'
-evaluation_inputs = ['Generate an overview summarizing the principal findings from the pathology examination of the whole slide image.']
-# Breast, core-needle biopsy;\n  Invasive carcinoma of no special type, grade I (Tubule formation: 2, Nuclear grade: 2, Mitoses: 1)
+SYSTEM = SYSTEM_TEMPLATE.alpaca
+evaluation_inputs = [
+    'What famous British author, known for his tales of mystery and the macabre, shares his initials with a common abbreviation for "rest in peace"?',  # noqa: E501
+    "Please tell me five scenic spots in Shanghai",
+    "890729 - 425663? Only respond with math and no words.",
+]
 
 #######################################################################
-#            PART 2  Model & Tokenizer & Image Processor              #
+#                      PART 2  Model & Tokenizer                      #
 #######################################################################
 tokenizer = dict(
     type=AutoTokenizer.from_pretrained,
-    pretrained_model_name_or_path=llm_name_or_path,
+    pretrained_model_name_or_path=pretrained_model_name_or_path,
     trust_remote_code=True,
-    padding_side='right')
+    padding_side="right",
+)
 
 model = dict(
-    type=LLaVAModel,
-    freeze_llm=False,
-    train_stage='1',
+    type=DPO,
+    use_varlen_attn=use_varlen_attn,
+    loss_type=dpo_loss_type,
+    beta=loss_beta,
+    label_smoothing=label_smoothing,
     llm=dict(
         type=AutoModelForCausalLM.from_pretrained,
-        pretrained_model_name_or_path=llm_name_or_path,
+        pretrained_model_name_or_path=pretrained_model_name_or_path,
         trust_remote_code=True,
     ),
-    llm_lora=dict(
-        type=LoraConfig,
-        r=256,
-        lora_alpha=512,
-        lora_dropout=0.05,
-        bias="none",
-        task_type="CAUSAL_LM"
-    )
 )
 
 #######################################################################
 #                      PART 3  Dataset & Dataloader                   #
 #######################################################################
-llava_dataset = dict(
-    type=LLaVADataset,
-    data_path=data_path,
-    image_folder='',
-    image_path_list=image_path_list,
+train_dataset = dict(
+    type=build_preference_dataset,
+    dataset=dict(type=load_dataset, path="mlabonne/orpo-dpo-mix-40k"),
     tokenizer=tokenizer,
-    dataset_map_fn=llava_map_fn,
-    template_map_fn=dict(
-        type=template_map_fn_factory, template=prompt_template),
     max_length=max_length,
-    per_image_length=per_image_length,
-    pad_image_to_square=False)
-
-# cying: add: per_image_length=per_image_length,
+    dataset_map_fn=orpo_dpo_mix_40k_map_fn,
+    is_dpo=True,
+    is_reward=False,
+    reward_token_id=-1,
+    num_proc=32,
+    use_varlen_attn=use_varlen_attn,
+    shuffle_before_pack=True,
+)
 
 train_dataloader = dict(
     batch_size=batch_size,
     num_workers=dataloader_num_workers,
-    pin_memory=True,
-    dataset=llava_dataset,
+    dataset=train_dataset,
     sampler=dict(type=DefaultSampler, shuffle=True),
-    collate_fn=dict(type=default_collate_fn))
+    collate_fn=dict(type=preference_collate_fn, use_varlen_attn=use_varlen_attn),
+)
 
 #######################################################################
 #                    PART 4  Scheduler & Optimizer                    #
@@ -117,30 +119,32 @@ train_dataloader = dict(
 # optimizer
 optim_wrapper = dict(
     type=AmpOptimWrapper,
-    optimizer=dict(
-        type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
+    optimizer=dict(type=optim_type, lr=lr, betas=betas, weight_decay=weight_decay),
     clip_grad=dict(max_norm=max_norm, error_if_nonfinite=False),
     accumulative_counts=accumulative_counts,
-    loss_scale='dynamic',
-    dtype='float16')
+    loss_scale="dynamic",
+    dtype="float16",
+)
 
 # learning policy
 # More information: https://github.com/open-mmlab/mmengine/blob/main/docs/en/tutorials/param_scheduler.md  # noqa: E501
 param_scheduler = [
-    # dict(
-    #     type=LinearLR,
-    #     start_factor=1e-5,
-    #     by_epoch=True,
-    #     begin=0,
-    #     end=warmup_ratio * max_epochs,
-    #     convert_to_iter_based=True),
+    dict(
+        type=LinearLR,
+        start_factor=1e-5,
+        by_epoch=True,
+        begin=0,
+        end=warmup_ratio * max_epochs,
+        convert_to_iter_based=True,
+    ),
     dict(
         type=CosineAnnealingLR,
         eta_min=0.0,
         by_epoch=True,
-        begin=0,
+        begin=warmup_ratio * max_epochs,
         end=max_epochs,
-        convert_to_iter_based=True)
+        convert_to_iter_based=True,
+    ),
 ]
 
 # train, val, test setting
@@ -157,10 +161,13 @@ custom_hooks = [
         tokenizer=tokenizer,
         every_n_iters=evaluation_freq,
         evaluation_inputs=evaluation_inputs,
-        evaluation_images=evaluation_images,
         system=SYSTEM,
-        prompt_template=prompt_template)
+        prompt_template=prompt_template,
+    ),
 ]
+
+if use_varlen_attn:
+    custom_hooks += [dict(type=VarlenAttnArgsToMessageHubHook)]
 
 # configure default hooks
 default_hooks = dict(
@@ -175,7 +182,8 @@ default_hooks = dict(
         type=CheckpointHook,
         by_epoch=False,
         interval=save_steps,
-        max_keep_ckpts=save_total_limit),
+        max_keep_ckpts=save_total_limit,
+    ),
     # set sampler seed in distributed evrionment.
     sampler_seed=dict(type=DistSamplerSeedHook),
 )
@@ -185,23 +193,23 @@ env_cfg = dict(
     # whether to enable cudnn benchmark
     cudnn_benchmark=False,
     # set multi process parameters
-    mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0),
+    mp_cfg=dict(mp_start_method="fork", opencv_num_threads=0),
     # set distributed parameters
-    dist_cfg=dict(backend='nccl'),
+    dist_cfg=dict(backend="nccl"),
 )
 
 # set visualizer
 visualizer = None
 
 # set log level
-log_level = 'INFO'
+log_level = "INFO"
 
 # load from which checkpoint
 load_from = None
 
 # whether to resume training from the loaded checkpoint
 resume = False
- 
+
 # Defaults to use random seed and disable `deterministic`
 randomness = dict(seed=None, deterministic=False)
 

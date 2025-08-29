@@ -41,7 +41,7 @@ class LLaVADataset(Dataset):
                  template_map_fn=None,
                  max_length=2048,
                  pad_image_to_square=False,
-                 sample_num=10240):
+                 sample_num=3000):
         super().__init__()
 
         self.sample_num = sample_num
@@ -125,7 +125,6 @@ class LLaVADataset(Dataset):
                         indices = np.linspace(0, total_rows - 1, self.sample_num, dtype=int)
                         sampled_df = image.iloc[indices]
                         image = sampled_df.iloc[:self.sample_num]
-                    
                     image = image.to_numpy()
                     image = torch.from_numpy(image)
                 images.append(image)
